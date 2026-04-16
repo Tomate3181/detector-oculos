@@ -5,140 +5,95 @@ import time
 # --- CONFIGURAÇÕES ---
 PROTO_PATH = "deploy.prototxt"
 MODEL_PATH = "res10_300x300_ssd_iter_140000.caffemodel"
-CONFIDENCE_THRESHOLD = 0.5
-
-# Carrega a rede neural
 net = cv2.dnn.readNetFromCaffe(PROTO_PATH, MODEL_PATH)
-qr_detector = cv2.QRCodeDetector()
-
-def draw_ar_ui(img, x, y, w, h, label, color):
-    """Desenha uma interface de óculos AR ao redor do objeto."""
-    t = 2 # espessura
-    l = 20 # comprimento do canto
-    
-    # Cantos da moldura (Estilo Mira AR)
-    cv2.line(img, (x, y), (x + l, y), color, t)
-    cv2.line(img, (x, y), (x, y + l), color, t)
-    
-    cv2.line(img, (x + w, y), (x + w - l, y), color, t)
-    cv2.line(img, (x + w, y), (x + w, y + l), color, t)
-    
-    cv2.line(img, (x, y + h), (x + l, y + h), color, t)
-    cv2.line(img, (x, y + h), (x, y + h - l), color, t)
-    
-    cv2.line(img, (x + w, y + h), (x + w - l, y + h), color, t)
-    cv2.line(img, (x + w, y + h), (x + w, y + h - l), color, t)
-    
-    # Label com fundo semi-transparente
-    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-    cv2.rectangle(img, (x, y - 25), (x + label_size[0] + 10, y), color, -1)
-    cv2.putText(img, label, (x + 5, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
 
 def apply_strong_blur(img, x, y, w, h):
-    """Aplica um borrão denso com travas de segurança contra crash."""
-    # 1. Garante que as coordenadas estão dentro dos limites da imagem
-    img_h, img_w = img.shape[:2]
-    x, y = max(0, x), max(0, y)
-    w = min(w, img_w - x)
-    h = min(h, img_h - y)
-
-    # 2. Verifica se a região tem um tamanho válido (maior que zero)
-    if w > 1 and h > 1:
+    """Borrão seguro com travas de limite."""
+    ih, iw = img.shape[:2]
+    x, y, w, h = max(0, x), max(0, y), min(w, iw-x), min(h, ih-y)
+    if w > 5 and h > 5:
         roi = img[y:y+h, x:x+w]
-        
-        # 3. Verifica se a ROI não está vazia de fato
-        if roi is not None and roi.size > 0:
-            try:
-                # O kernel do stackBlur precisa ser ímpar e > 0
-                blur_size = 91
-                blur = cv2.stackBlur(roi, (blur_size, blur_size))
-                img[y:y+h, x:x+w] = blur
-            except cv2.error as e:
-                print(f"[AVISO] Falha ao borrar região: {e}")
-    
+        if roi.size > 0:
+            img[y:y+h, x:x+w] = cv2.stackBlur(roi, (91, 91))
     return img
 
+def is_valid_screen(approx, bw, bh):
+    """Valida se o retângulo detectado tem proporções de tela/documento."""
+    if bh == 0: return False
+    ar = bw / float(bh)
+    
+    # Proporções aceitáveis: 0.5 (celular em pé) até 2.2 (monitor ultra-wide)
+    if not (0.4 < ar < 2.5):
+        return False
+        
+    # Verifica a "convexidade" - telas são retângulos perfeitos, não formas estranhas
+    area = cv2.contourArea(approx)
+    hull = cv2.convexHull(approx)
+    hull_area = cv2.contourArea(hull)
+    if hull_area == 0: return False
+    
+    solidity = float(area) / hull_area
+    if solidity < 0.9: # Se for menor que 90%, a forma é muito irregular para ser uma tela
+        return False
+        
+    return True
+
 def main():
-    cap = cv2.VideoCapture(0)
-    prev_time = 0
+    cap = cv2.VideoCapture(0) # Mude para 1 ou URL se necessário
+    
+    # Histórico para estabilidade (Dicionário para rastrear detecções)
+    screen_history = [] 
 
     while True:
         ret, frame = cap.read()
-        if not ret: break
+        if not ret or frame is None: continue
         
-        # Efeito de "Scan" global (opcional: escurece um pouco a imagem para o HUD brilhar)
-        # frame = cv2.addWeighted(frame, 0.8, np.zeros(frame.shape, frame.dtype), 0, 0)
-        
-        h, w = frame.shape[:2]
         display_frame = frame.copy()
+        h, w = frame.shape[:2]
 
-        # 1. ROSTOS (DNN)
+        # --- DETECÇÃO DE ROSTOS (JÁ ESTÁ PRECISA) ---
         blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
         net.setInput(blob)
         detections = net.forward()
-
         for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence > CONFIDENCE_THRESHOLD:
+            if detections[0, 0, i, 2] > 0.6: # Aumentei o threshold para 60%
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 (x1, y1, x2, y2) = box.astype("int")
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w-1, x2), min(h-1, y2)
-                
                 apply_strong_blur(display_frame, x1, y1, x2-x1, y2-y1)
-                draw_ar_ui(display_frame, x1, y1, x2-x1, y2-y1, f"PESSOA {int(confidence*100)}%", (0, 255, 255))
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-        # 2. QR CODES
-        ok, points = qr_detector.detect(frame)
-        if ok and points is not None:
-            pts = points[0].astype(int)
-            x_min, y_min = np.min(pts, axis=0)
-            x_max, y_max = np.max(pts, axis=0)
-            apply_strong_blur(display_frame, x_min, y_min, x_max-x_min, y_max-y_min)
-            draw_ar_ui(display_frame, x_min, y_min, x_max-x_min, y_max-y_min, "DADO SENSIVEL (QR)", (0, 0, 255))
-
-        # 3. TELAS E DOCUMENTOS (Processamento Avançado)
+        # --- DETECÇÃO DE TELAS COM FILTROS RÍGIDOS ---
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-        edged = cv2.Canny(blurred, 30, 150)
+        # Blur mais forte antes do Canny ajuda a ignorar detalhes irrelevantes dentro da tela
+        blurred = cv2.medianBlur(gray, 7) 
+        edged = cv2.Canny(blurred, 50, 200)
         
-        # Dilatação para fechar os contornos de telas/celulares
+        # Operação morfológica para unir bordas quebradas
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-        edged = cv2.dilate(edged, kernel, iterations=1)
+        closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        current_screens = []
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if 10000 < area < (w * h * 0.8): # Nem muito pequeno, nem o frame todo
+            if cv2.contourArea(cnt) > 15000: # Exige um tamanho mínimo considerável
                 peri = cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, 0.04 * peri, True) # 0.04 aumenta a tolerância
+                approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
                 
-                if len(approx) == 4: # Retângulos
+                if len(approx) == 4:
                     x, y, bw, bh = cv2.boundingRect(approx)
-                    aspect_ratio = bw / float(bh)
-                    # Filtra proporções comuns de telas (celular em pé ou deitado / monitor)
-                    if 0.4 < aspect_ratio < 2.5:
+                    if is_valid_screen(approx, bw, bh):
+                        # Se passou em todos os filtros, adicionamos à lista
+                        current_screens.append((x, y, bw, bh))
                         apply_strong_blur(display_frame, x, y, bw, bh)
-                        draw_ar_ui(display_frame, x, y, bw, bh, "CONTEUDO RESTRITO", (0, 255, 0))
+                        cv2.drawContours(display_frame, [approx], -1, (0, 255, 0), 2)
+                        cv2.putText(display_frame, "SCREEN DETECTED", (x, y-10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # UI do Sistema (Cantos da tela)
-        cv2.putText(display_frame, "MODO PRIVACIDADE: ATIVO", (20, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # Cálculo de FPS
-        curr_time = time.time()
-        fps = 1 / (curr_time - prev_time)
-        prev_time = curr_time
-        cv2.putText(display_frame, f"SYS_LATENCY: {int((1/fps)*1000)}ms", (20, 55), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-
-        cv2.imshow("AR Privacy OS v1.0", display_frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        cv2.imshow("Privacy Shield AR - High Precision", display_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    main()
+main()
